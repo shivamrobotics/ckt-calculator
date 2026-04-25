@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Heat Exchanger — Even/Odd Distribution Tool</title>
+<style>
+  :root{--card:#fff;--bg:#eef2f5;--accent:#0056b3;--muted:#6c757d}
+  body{font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);margin:0;padding:28px;}
+  .card{max-width:880px;margin:0 auto;background:var(--card);padding:22px;border-radius:12px;box-shadow:0 8px 30px rgba(18,38,63,0.08)}
+  h1{margin:0 0 12px;color:var(--accent);font-size:20px}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  label{font-size:13px;color:#222;font-weight:600}
+  input[type=number], select, input[type=text] {width:100%;padding:8px;border-radius:8px;border:1px solid #d0d7de;font-size:14px}
+  .actions{display:flex;gap:8px;margin-top:12px}
+  button{padding:10px 12px;border-radius:10px;border:none;background:linear-gradient(90deg,var(--accent),#003e8a);color:#fff;font-weight:700;cursor:pointer}
+  .btn-ghost{background:#f4f6f8;color:#333;border:1px solid #dfe6ee}
+  #result{margin-top:18px;padding:14px;border-radius:10px;background:#fbfdff;border-left:6px solid var(--accent);white-space:pre-wrap;font-family:Menlo,Consolas,monospace}
+  .small{font-size:13px;color:var(--muted)}
+  .controls-row{display:flex;gap:10px;align-items:center}
+  .checkbox{display:flex;gap:6px;align-items:center}
+  .explore-list{margin-top:8px}
+  @media (max-width:740px){.grid{grid-template-columns:repeat(1,1fr)}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Heat Exchanger Circuit Distribution — Even/Odd Tool</h1>
+  <p class="small">Enter plate geometry and constraints. This tool computes balanced distributions while respecting parity constraints (Even / Odd / Both) and helps compute required dummy holes to reach target patterns.</p>
+
+  <div class="grid" style="margin-top:14px">
+    <div>
+      <label>Number of Vertical Holes</label>
+      <input id="vertical" type="number" min="1" value="48">
+    </div>
+    <div>
+      <label>Number of Horizontal Holes</label>
+      <input id="horizontal" type="number" min="1" value="2">
+    </div>
+    <div>
+      <label>Number of Circuits (CKTs)</label>
+      <input id="ckt" type="number" min="1" value="14">
+    </div>
+
+    <div>
+      <label>Dummy Holes</label>
+      <input id="dummy" type="number" min="0" value="14">
+    </div>
+    <div>
+      <label>Parity Preference</label>
+      <select id="parity">
+        <option value="both">Both (even & odd)</option>
+        <option value="even" selected>Only Even</option>
+        <option value="odd">Only Odd</option>
+      </select>
+    </div>
+    <div>
+      <label>Minimum holes per CKT</label>
+      <input id="minHole" type="number" min="0" value="2">
+    </div>
+  </div>
+
+  <div class="controls-row" style="margin-top:14px">
+    <div style="flex:1">
+      <button onclick="calculate()">🔹 Calculate Distribution</button>
+    </div>
+    <div style="width:220px">
+      <button class="btn-ghost" onclick="listTwoSizeSolutions()">🧭 List feasible 2-size solutions</button>
+    </div>
+    <div style="width:300px">
+      <input id="targetInput" type="text" placeholder="Target (e.g. 6:4,8:10  OR 6,8 )" >
+    </div>
+    <div style="width:140px">
+      <button class="btn-ghost" onclick="solveTarget()">⚙️ Solve Target</button>
+    </div>
+  </div>
+
+  <div id="result" style="display:none"></div>
+</div>
+
+<script>
+function readInputs(){
+  const v = parseInt(document.getElementById('vertical').value);
+  const h = parseInt(document.getElementById('horizontal').value);
+  const n = parseInt(document.getElementById('ckt').value);
+  const d = parseInt(document.getElementById('dummy').value);
+  const parity = document.getElementById('parity').value;
+  const minHole = Math.max(0, parseInt(document.getElementById('minHole').value) || 0);
+  return {v,h,n,d,parity,minHole};
+}
+
+function show(msg){
+  const r = document.getElementById('result'); r.style.display='block'; r.textContent = msg;
+}
+
+function calculate(){
+  const {v,h,n,d,parity,minHole} = readInputs();
+  if([v,h,n,d].some(x=>Number.isNaN(x))){ show('❌ Fill all inputs correctly.'); return; }
+  const total = v*h; const usable = total - d;
+  if(usable < n*minHole){ show(`❌ Not enough usable holes. Usable=${usable}, required minimum=${n*minHole}`); return; }
+
+  // parity quick checks
+  if(parity==='even' && (usable % 2 !== 0)){
+    show(`❌ Parity impossible: usable holes (${usable}) is odd but you require only even per-CKT values (sum of evens must be even).`); return;
+  }
+  if(parity==='odd' && (n % 2 === 0) && (usable % 2 === 0)){
+    // not a strict impossibility, but sum of even number of odd values is even; if usable even it's OK
+  }
+
+  // If parity is both -> simple balanced
+  if(parity==='both'){
+    const base = Math.floor(usable/n); const extra = usable % n;
+    const parts = Array(n).fill(base);
+    for(let i=0;i<extra;i++) parts[i]++;
+    summarize(total,usable,n,d,parts,'Balanced (both parities allowed)');
+    return;
+  }
+
+  // For parity restricted (even/odd) try to find nearest two-value solution with step 2
+  const solutions = findTwoStepSolutions(usable,n,parity,minHole);
+  if(solutions.length===0){ show('❌ No feasible even/odd-balanced distribution found with these inputs. Try changing dummy or N.'); return; }
+  // pick best: smallest absolute deviation from average value
+  const avg = usable / n;
+  solutions.sort((a,b)=> Math.abs(a.v+ (2*a.y/a.n) - avg) - Math.abs(b.v + (2*b.y/b.n) - avg));
+  const best = solutions[0];
+  // build parts array: best.x circuits with best.v, best.y circuits with best.v+2
+  const parts = [];
+  for(let i=0;i<best.x;i++) parts.push(best.v);
+  for(let i=0;i<best.y;i++) parts.push(best.v+2);
+  // pad if needed
+  while(parts.length < n) parts.push(best.v);
+  summarize(total,usable,n,d,parts,`Parity-only distribution (values ${best.v} & ${best.v+2})`);
+}
+
+function summarize(total, usable, n, d, parts, note){
+  // build counts
+  const types = {};
+  parts.forEach(p=> types[p] = (types[p]||0)+1);
+  let out = '';
+  out += `Total Holes (V x H): ${total}\n`;
+  out += `Dummy Holes: ${d}\n`;
+  out += `Usable Holes: ${usable}\n`;
+  out += `Requested CKTs: ${n}\n`;
+  out += `Note: ${note}\n\n`;
+  out += `Distribution:\n`;
+  Object.keys(types).sort((a,b)=>a-b).forEach(k=> out += ` - ${types[k]} CKTs with ${k} holes\n`);
+  out += `\nPer-CKT list (first 40 shown): \n` + parts.slice(0,40).join(', ') + (parts.length>40? ', ...':'') + '\n';
+  show(out);
+}
+
+// Find two-step solutions (s and s+2) matching parity (even/odd)
+function findTwoStepSolutions(U,N,parity,minHole){
+  const sols = [];
+  // iterate candidate base values s that match parity and are >= minHole
+  const maxBase = Math.floor(U/N) + 20; // small search window
+  for(let s = Math.max(0,minHole); s <= maxBase; s++){
+    if(parity==='even' && (s %2 !==0)) continue;
+    if(parity==='odd' && (s %2 ===0)) continue;
+    const s2 = s+2;
+    // solve for x (# of s) using formula: x = ((s2)*N - U)/2
+    const num = (s2 * N - U);
+    if(num % 2 !== 0) continue; // must be integer
+    const x = num / 2;
+    const y = N - x;
+    if(x < 0 || y < 0) continue;
+    // sanity: sum check
+    if(s*x + s2*y !== U) continue;
+    sols.push({v:s,x,y,n:N});
+  }
+  // also check single-value uniform solution
+  if(U % N === 0){ const val = U / N; if((parity==='both') || (parity==='even' && val%2===0) || (parity==='odd' && val%2===1)){
+    if(val >= minHole) sols.push({v:val,x:N,y:0,n:N});
+  }}
+  return sols;
+}
+
+function listTwoSizeSolutions(){
+  const {v,h,n,d,parity,minHole} = readInputs();
+  if([v,h,n,d].some(x=>Number.isNaN(x))){ show('❌ Fill all inputs correctly.'); return; }
+  const total = v*h; const U = total - d;
+  if(U < n*minHole){ show('❌ Not enough usable holes for minimum requirement.'); return; }
+  if(parity==='even' && (U%2 !==0)){ show('❌ Usable holes odd — no all-even partition exists.'); return; }
+  const sols = findTwoStepSolutions(U,n,parity,minHole);
+  if(sols.length===0){ show('No feasible two-step solutions found.'); return; }
+  let out = `Feasible 2-size solutions for usable=${U} (s, s+2 pairs):\n\n`;
+  sols.forEach(s=> out += ` - ${s.x} CKTs with ${s.v} holes  +  ${s.y} CKTs with ${s.v+2} holes\n`);
+  show(out);
+}
+
+// Parse target like "6:4,8:10" or "6,8". If counts provided, validate; else brute force counts for up to 3 sizes.
+function solveTarget(){
+  const t = (document.getElementById('targetInput').value || '').trim();
+  if(!t){ show('❌ Enter a target. Examples: "6:4,8:10" (size:count) or "6,8" (sizes only).'); return; }
+  const {v,h,n,d} = readInputs(); const total = v*h; const U = total - d;
+  // detect if counts provided
+  const parts = t.split(',').map(s=> s.trim()).filter(Boolean);
+  const sizes = [];
+  let countsGiven = true;
+  for(const p of parts){
+    if(p.includes(':')){
+      const [sStr,cStr] = p.split(':').map(x=>x.trim());
+      const s = parseInt(sStr), c = parseInt(cStr);
+      if(Number.isNaN(s) || Number.isNaN(c)){ show('❌ Invalid target format.'); return; }
+      sizes.push({s,c});
+    } else {
+      const s = parseInt(p);
+      if(Number.isNaN(s)){ show('❌ Invalid target format.'); return; }
+      sizes.push({s,c:null}); countsGiven = false;
+    }
+  }
+
+  // If counts provided: verify sums and compute required dummy
+  if(countsGiven){
+    const totalCount = sizes.reduce((a,b)=>a+(b.c||0),0);
+    const requiredU = sizes.reduce((a,b)=>a + b.s * b.c,0);
+    const msgParts = [];
+    msgParts.push(`Total plate holes = ${total}, current dummy = ${d}, current usable = ${U}`);
+    msgParts.push(`Requested pattern uses ${totalCount} CKTs and needs ${requiredU} usable holes.`);
+    if(totalCount !== n){ msgParts.push(`❌ Provided counts sum to ${totalCount} but N=${n}.`); show(msgParts.join('\n')); return; }
+    const neededDummy = total - requiredU;
+    if(neededDummy < 0){ msgParts.push(`❌ Impossible on this plate: requires ${-neededDummy} more holes (increase plate or reduce targets).`); show(msgParts.join('\n')); return; }
+    msgParts.push(`To achieve it set dummy = ${neededDummy} (current dummy ${d}). \nChange dummy by ${neededDummy - d >=0 ? ('+' + (neededDummy-d)):(neededDummy-d)}`);
+    show(msgParts.join('\n'));
+    return;
+  }
+
+  // Counts not given: brute force up to 3 sizes
+  const sizeVals = sizes.map(x=>x.s);
+  if(sizeVals.length > 3){ show('Only up to 3 distinct sizes supported in brute-force mode.'); return; }
+  // brute force counts
+  const N = n; const Utotal = U;
+  const results = [];
+  if(sizeVals.length === 1){
+    const s = sizeVals[0];
+    if((s*N) === Utotal) results.push(`${N} CKTs with ${s} holes`);
+  } else if(sizeVals.length === 2){
+    const [s1,s2] = sizeVals;
+    for(let k1=0;k1<=N;k1++){
+      const k2 = N - k1;
+      if(s1*k1 + s2*k2 === Utotal) results.push(`${k1} CKTs @${s1} and ${k2} CKTs @${s2}`);
+    }
+  } else if(sizeVals.length === 3){
+    const [s1,s2,s3] = sizeVals;
+    for(let k1=0;k1<=N;k1++){
+      for(let k2=0;k2<=N-k1;k2++){
+        const k3 = N - k1 - k2;
+        if(s1*k1 + s2*k2 + s3*k3 === Utotal) results.push(`${k1}@${s1}, ${k2}@${s2}, ${k3}@${s3}`);
+      }
+    }
+  }
+  if(results.length===0) show('No combinations found for those sizes with current usable holes. Try adjusting dummy or N.');
+  else show('Feasible combinations:\n' + results.join('\n'));
+}
+</script>
+</body>
+</html>
